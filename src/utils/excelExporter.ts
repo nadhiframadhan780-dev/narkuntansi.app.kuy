@@ -256,10 +256,6 @@ export function buildGeneralJournalWorkbook(wb: ExcelJS.Workbook, transactions: 
   return ws;
 }
 
-export function buildLedgerSheet(wb: ExcelJS.Workbook, accounts: Account[], transactions: Transaction[], settings: EntitySettings, standard: AccountingStandard): ExcelJS.Worksheet {
-  return buildLedgerWorkbook(wb, accounts, transactions, settings, standard);
-}
-
 /**
  * 2. Sheet Buku Besar
  */
@@ -1205,4 +1201,76 @@ export async function exportSingleClosingEntriesToExcel(accounts: Account[], tra
   buildClosingEntriesWorkbook(wb, accounts, transactions, settings, standard);
   const buffer = await wb.xlsx.writeBuffer();
   saveAs(new Blob([buffer], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' }), `Jurnal_Penutup_${settings.entityName.replace(/[^a-zA-Z0-9]/g, '_')}.xlsx`);
+}
+
+/**
+ * ---------------------------------------------------------------------------
+ * Standalone single-sheet builders + generic exporter
+ * ---------------------------------------------------------------------------
+ * These wrap the *Workbook builders above, creating a fresh, self-contained
+ * ExcelJS.Workbook for a single sheet. The resulting Worksheet keeps a
+ * reference back to its parent workbook (ws.workbook), which is what
+ * `exportSingleSheetToExcel` uses to serialize and download the file.
+ * This lets view components build a sheet and export it in two decoupled
+ * steps (e.g. for previewing or reusing the worksheet before exporting).
+ */
+
+function createSingleSheetWorkbook(): ExcelJS.Workbook {
+  const wb = new ExcelJS.Workbook();
+  wb.creator = 'NarKuntansi by Nadhif A.R';
+  wb.created = new Date();
+  wb.modified = new Date();
+  return wb;
+}
+
+/**
+ * Builds a standalone "Buku Besar" (General Ledger) worksheet.
+ */
+export function buildLedgerSheet(accounts: Account[], transactions: Transaction[], settings: EntitySettings, standard: AccountingStandard): ExcelJS.Worksheet {
+  const wb = createSingleSheetWorkbook();
+  wb.lastModifiedBy = settings.entityName;
+  return buildLedgerWorkbook(wb, accounts, transactions, settings, standard);
+}
+
+/**
+ * Builds a standalone "Kertas Kerja 10 Kolom" (10-Column Worksheet) worksheet.
+ */
+export function buildWorksheetSheet(accounts: Account[], transactions: Transaction[], settings: EntitySettings, standard: AccountingStandard): ExcelJS.Worksheet {
+  const wb = createSingleSheetWorkbook();
+  wb.lastModifiedBy = settings.entityName;
+  return buildWorksheetWorkbook(wb, accounts, transactions, settings, standard);
+}
+
+/**
+ * Builds a standalone "Neraca Saldo" (Trial Balance) worksheet.
+ */
+export function buildTrialBalanceSheet(accounts: Account[], transactions: Transaction[], settings: EntitySettings, standard: AccountingStandard): ExcelJS.Worksheet {
+  const wb = createSingleSheetWorkbook();
+  wb.lastModifiedBy = settings.entityName;
+  return buildTrialBalanceWorkbook(wb, accounts, transactions, settings, standard);
+}
+
+/**
+ * Builds a standalone "Jurnal Penutup" (Closing Entries) worksheet.
+ */
+export function buildClosingEntriesSheet(accounts: Account[], transactions: Transaction[], settings: EntitySettings, standard: AccountingStandard): ExcelJS.Worksheet {
+  const wb = createSingleSheetWorkbook();
+  wb.lastModifiedBy = settings.entityName;
+  return buildClosingEntriesWorkbook(wb, accounts, transactions, settings, standard);
+}
+
+/**
+ * Serializes the parent workbook of a single worksheet (built via one of the
+ * build*Sheet functions above) and triggers a download as .xlsx.
+ * `sheetName` is accepted for API clarity/back-compat but the worksheet's
+ * own name (set when it was added to its workbook) is what Excel displays.
+ */
+export async function exportSingleSheetToExcel(sheetName: string, ws: ExcelJS.Worksheet, filename: string): Promise<void> {
+  const wb = ws.workbook;
+  if (!wb) {
+    throw new Error(`Tidak dapat mengekspor sheet "${sheetName}": worksheet tidak terhubung ke workbook manapun.`);
+  }
+  const buffer = await wb.xlsx.writeBuffer();
+  const blob = new Blob([buffer], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
+  saveAs(blob, filename);
 }
