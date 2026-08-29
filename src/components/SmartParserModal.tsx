@@ -140,7 +140,7 @@ export const SmartParserModal: React.FC<SmartParserModalProps> = ({
             <div>
               <h3 className="text-lg font-bold font-editorial-serif">Parser Transaksi Otomatis NarKuntansi</h3>
               <p className="text-xs text-[#D3CBC0] mt-0.5 font-editorial-sans">
-                Konversi narasi soal cerita akuntansi Indonesia ke Jurnal Umum berpasangan (Debit = Kredit)
+                Konversi narasi soal cerita akuntansi Indonesia menjadi Jurnal Umum & Jurnal Penyesuaian (AJP) secara otomatis
               </p>
             </div>
           </div>
@@ -229,7 +229,7 @@ export const SmartParserModal: React.FC<SmartParserModalProps> = ({
                   Hasil Terjemahan Jurnal ({drafts.length} Transaksi)
                 </h4>
                 <span className="text-xs text-[#5C5852]">
-                  Periksa kebenaran akun dan angka sebelum diimpor ke Jurnal Umum
+                  Periksa kebenaran akun dan angka sebelum diimpor — sistem akan mengarahkan otomatis ke Jurnal Umum atau Jurnal Penyesuaian sesuai kategori di atas
                 </span>
               </div>
 
@@ -245,13 +245,27 @@ export const SmartParserModal: React.FC<SmartParserModalProps> = ({
                   >
                     <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 mb-2 pb-2 border-b border-[#E6E0D6]">
                       <div>
-                        <div className="flex items-center gap-2">
+                        <div className="flex flex-wrap items-center gap-2">
                           <span className="font-bold text-xs bg-[#F4F1EA] px-2 py-0.5 rounded text-[#1A1A1A] font-editorial-mono">
                             {draft.refNumber}
                           </span>
+                          <span
+                            className={`text-[10px] font-bold px-2 py-0.5 rounded uppercase tracking-wide ${
+                              draft.category === 'penyesuaian'
+                                ? 'bg-[#FEF3C7] text-[#92400E] border border-[#FDE68A]'
+                                : 'bg-[#DBEAFE] text-[#1E40AF] border border-[#BFDBFE]'
+                            }`}
+                          >
+                            {draft.category === 'penyesuaian' ? 'Jurnal Penyesuaian (AJP)' : 'Jurnal Umum'}
+                          </span>
+                          {draft.needsReview && (
+                            <span className="text-[10px] font-bold px-2 py-0.5 rounded uppercase tracking-wide bg-[#FEE2E2] text-[#991B1B] border border-[#FECACA]">
+                              Perlu Ditinjau
+                            </span>
+                          )}
                           <span className="text-xs text-[#8C877E] font-editorial-mono">{draft.date}</span>
-                          <span className="text-sm font-semibold text-[#1A1A1A] font-editorial-serif">{draft.description}</span>
                         </div>
+                        <span className="text-sm font-semibold text-[#1A1A1A] font-editorial-serif">{draft.description}</span>
                       </div>
                       <div>
                         {draft.isBalanced ? (
