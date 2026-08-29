@@ -3,6 +3,7 @@ import path from "path";
 import { createServer as createViteServer } from "vite";
 import { GoogleGenAI } from "@google/genai";
 import dotenv from "dotenv";
+import { buildAiChatSystemPrompt, buildParseTransactionSystemPrompt } from "./lib/aiPrompts";
 
 dotenv.config();
 
@@ -81,28 +82,7 @@ async function startServer() {
         });
       }
 
-      const standardNames: Record<string, string> = {
-        PSAK: "SAK Umum / PSAK (IFRS)",
-        SAK_EMKM: "SAK EMKM (Entitas Mikro, Kecil, Menengah)",
-        SAK_SYARIAH: "SAK Syariah (Tanpa Bunga/Riba, akad Murabahah/Mudharabah/Musyarakah/Ijarah/Zakat)",
-        SAK_EP: "SAK Entitas Privat (SAK EP 2025)",
-        SAP: "SAP (Standar Akuntansi Pemerintahan PP 71/2010)",
-      };
-
-      const systemPrompt = `Anda adalah "NarKuntansi AI CPA", asisten Akuntan Publik Indonesia yang sangat ahli dan berwibawa dalam 5 standar akuntansi Indonesia (PSAK/IFRS, SAK EMKM, SAK Syariah, SAK EP, SAP).
-Anda bertugas menjawab seluruh pertanyaan akuntansi, memberikan solusi soal kasus, menjelaskan teori, menyusun jurnal penyesuaian/penutup, rumus depresiasi, analisis rasio, serta perpajakan terkait dengan akurasi 100%.
-
-Standar Akuntansi Aktif: ${standardNames[standard] || standard || "PSAK"}
-
-Daftar Akun yang tersedia saat ini:
-${JSON.stringify((coaList || []).slice(0, 80).map((a: any) => ({ code: a.code, name: a.name, category: a.category, normalBalance: a.normalBalance })), null, 2)}
-
-Ketentuan Jawaban:
-1. Berikan penjelasan yang komprehensif, terstruktur dengan rapi, mudah dimengerti, dan berlandaskan PSAK/SAK yang berlaku di Indonesia.
-2. Jika pengguna meminta jurnal, sertakan tabel/format Debit dan Kredit yang SEIMBANG (Total Debit = Total Kredit) beserta kode akun yang cocok.
-3. Untuk SAK Syariah: Patuhi Fatwa DSN-MUI dan PSAK Syariah (hindari konsep bunga/riba, gunakan margin, bagi hasil, atau ujrah).
-4. Untuk SAP: Ingat prinsip Dual-Track (Jurnal Finansial LO/Neraca dan Jurnal Anggaran LRA).
-5. Gunakan format Markdown yang rapi (bold, tabel, list, latex/persamaan matematika jika ada rumus).`;
+      const systemPrompt = buildAiChatSystemPrompt(standard, coaList);
 
       const modelName = model || "gemini-3.7-flash";
       const response = await ai.models.generateContent({
@@ -143,61 +123,12 @@ Ketentuan Jawaban:
         });
       }
 
-      const standardNames: Record<string, string> = {
-        PSAK: "SAK Umum / PSAK (IFRS)",
-        SAK_EMKM: "SAK EMKM (Mikro, Kecil, Menengah)",
-        SAK_SYARIAH: "SAK Syariah (Tanpa Bunga/Riba, akad Murabahah/Mudharabah/Musyarakah/Ijarah/Zakat)",
-        SAK_EP: "SAK Entitas Privat (SAK EP 2025)",
-        SAP: "SAP (Standar Akuntansi Pemerintahan PP 71/2010)",
-      };
-
-      const systemPrompt = `Anda adalah Akuntan Publik Indonesia (CPA) yang ahli dalam menyusun jurnal akuntansi double-entry untuk 5 standar akuntansi Indonesia.
-Tugas Anda adalah membaca soal cerita/transaksi akuntansi dalam bahasa Indonesia, lalu menganalisis dan memecahnya menjadi daftar entri jurnal umum yang seimbang (Total Debit = Total Kredit) sesuai standar akuntansi yang dipilih.
-
-Standar yang aktif: ${standardNames[standard] || standard || "SAK Umum / PSAK"}
-
-Daftar Akun yang tersedia (Chart of Accounts):
-${JSON.stringify(coaList || [], null, 2)}
-
-ATURAN WAJIB:
-1. Setiap transaksi HARUS balance: Total Debit === Total Kredit.
-2. Gunakan kode dan nama akun yang paling tepat dari daftar akun yang tersedia.
-3. Jika standar adalah SAK Syariah, TIDAK BOLEH ada akun "Bunga", gunakan Margin / Bagi Hasil / Ujrah.
-4. Nominal uang harus berupa bilangan bulat positif (Rupiah).
-5. Berikan tanggal (format YYYY-MM-DD), no ref (misal: JU-001), keterangan ringkas dan jelas, serta catatan analisis penjelasan akuntansi.
-6. Kembalikan response DALAM FORMAT JSON SAJA yang valid sesuai schema berikut.
-
-Format JSON Output:
-{
-  "transactions": [
-    {
-      "date": "2026-08-01",
-      "refNumber": "JU-001",
-      "description": "Keterangan transaksi ringkas",
-      "category": "umum",
-      "notes": "Penjelasan analisis akuntansi",
-      "entries": [
-        {
-          "accountCode": "101",
-          "accountName": "Kas",
-          "debit": 10000000,
-          "credit": 0
-        },
-        {
-          "accountCode": "301",
-          "accountName": "Modal Pemilik",
-          "debit": 0,
-          "credit": 10000000
-        }
-      ]
-    }
-  ]
-}`;
+      const systemPrompt = buildParseTransactionSystemPrompt(standard, coaList);
 
       const modelName = model || "gemini-3.7-flash";
       const response = await ai.models.generateContent({
         model: modelName,
-        contents: `Analisis seluruh transaksi soal cerita berikut dan buatkan entri jurnal akuntansinya:\n\n${text}`,
+        contents: `Analisis seluruh transaksi maupun data penyesuaian pada soal cerita berikut (baca sampai tuntas, termasuk bagian data penyesuaian di akhir soal jika ada) dan buatkan entri jurnalnya sesuai aturan klasifikasi kategori yang telah dijelaskan:\n\n${text}`,
         config: {
           systemInstruction: systemPrompt,
           responseMimeType: "application/json",
