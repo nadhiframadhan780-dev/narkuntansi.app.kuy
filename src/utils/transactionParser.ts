@@ -120,12 +120,21 @@ export function extractDate(text: string, defaultDate: string, autoDayIdx?: numb
 /**
  * Finds the closest matching account in the active COA
  */
+/**
+ * Finds an account by matching keywords against account names using WHOLE-WORD/PHRASE
+ * boundaries (not naive substring matching). This avoids false positives such as the
+ * keyword "utang" incorrectly matching inside the word "piutang" ("pi" + "utang usaha"),
+ * which would otherwise misroute credit-purchase entries to the wrong (receivable
+ * instead of payable) account.
+ */
 function findAccount(accounts: Account[], keywords: string[], defaultCode?: string): Account | undefined {
+  const escapeRegex = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
   for (const kw of keywords) {
+    const kwLower = kw.toLowerCase().trim();
+    const boundaryPattern = new RegExp(`(^|[^a-z])${escapeRegex(kwLower)}($|[^a-z])`, 'i');
     const acc = accounts.find(
-      (a) =>
-        a.name.toLowerCase().includes(kw.toLowerCase()) ||
-        a.code === kw
+      (a) => boundaryPattern.test(a.name.toLowerCase()) || a.code === kw
     );
     if (acc) return acc;
   }
@@ -195,13 +204,34 @@ export function parseStoryProblemRuleBased(
   const priveAcc = findAccount(accounts, ['prive', 'dividen']) || modalAcc;
   const perlengkapanAcc = findAccount(accounts, ['perlengkapan', 'alat tulis']) || kasAcc;
   const peralatanAcc = findAccount(accounts, ['peralatan', 'mesin', 'aset tetap']) || kasAcc;
+  const persediaanAcc = findAccount(accounts, ['persediaan barang dagang', 'aset murabahah', 'persediaan barang', 'persediaan']) || perlengkapanAcc;
   const pendapatanAcc = findAccount(accounts, ['pendapatan jasa', 'pendapatan penjualan', 'pendapatan usaha', 'pendapatan margin', 'pendapatan']) || accounts.find((a) => a.code.startsWith('4')) || kasAcc;
   const sewaAcc = findAccount(accounts, ['beban sewa', 'sewa dibayar dimuka']) || kasAcc;
   const sewaPrepaidAcc = findAccount(accounts, ['sewa dibayar dimuka', 'sewa dibayar di muka']) || sewaAcc;
   const gajiAcc = findAccount(accounts, ['beban gaji', 'gaji dan upah', 'gaji']) || kasAcc;
   const utilitasAcc = findAccount(accounts, ['beban utilitas', 'beban listrik, air & telepon', 'beban listrik', 'beban operasional']) || gajiAcc;
 
+  // Akun-akun khusus Jurnal Penyesuaian (Adjusting Journal Entries / AJP)
+  const akumulasiPenyusutanAcc = findAccount(accounts, ['akumulasi penyusutan aset tetap', 'akumulasi penyusutan peralatan dan mesin', 'akumulasi penyusutan peralatan', 'akumulasi penyusutan']) || peralatanAcc;
+  const bebanPenyusutanAcc = findAccount(accounts, ['beban penyusutan aset tetap', 'beban penyusutan aset tetap - lo', 'beban penyusutan']) || gajiAcc;
+  const bebanPerlengkapanAcc = findAccount(accounts, ['beban perlengkapan']) || perlengkapanAcc;
+  const asuransiPrepaidAcc = findAccount(accounts, ['asuransi dibayar dimuka', 'asuransi dibayar di muka']) || findAccount(accounts, ['beban dibayar dimuka']) || sewaPrepaidAcc;
+  const bebanDibayarDimukaAcc = findAccount(accounts, ['beban dibayar dimuka']) || sewaPrepaidAcc;
+  const bebanAsuransiAcc = findAccount(accounts, ['beban asuransi']) || utilitasAcc;
+  const pendapatanDiterimaDimukaAcc = findAccount(accounts, ['pendapatan diterima dimuka', 'pendapatan diterima di muka']) || utangAcc;
+  const utangGajiAcc = findAccount(accounts, ['utang gaji karyawan', 'utang gaji']) || findAccount(accounts, ['beban akrual yang masih harus dibayar', 'beban yang masih harus dibayar']) || utangAcc;
+  const bebanAkrualAcc = findAccount(accounts, ['beban akrual yang masih harus dibayar', 'beban yang masih harus dibayar']) || utangAcc;
+  const piutangPendapatanAcc = findAccount(accounts, ['piutang bunga', 'piutang pendapatan', 'piutang jasa']) || piutangAcc;
+  const cadanganKerugianPiutangAcc = findAccount(accounts, ['cadangan kerugian penurunan nilai piutang', 'penyisihan piutang tak tertagih', 'cadangan kerugian piutang']) || piutangAcc;
+  const bebanKerugianPiutangAcc = findAccount(accounts, ['beban penyisihan piutang', 'beban kerugian piutang', 'beban piutang tak tertagih']) || gajiAcc;
+
+  // Akumulasi nilai perlengkapan yang sudah dibeli sepanjang soal (dipakai untuk menghitung
+  // otomatis beban perlengkapan yang terpakai saat ada baris penyesuaian "perlengkapan tersisa/sisa").
+  let perlengkapanPurchasedTotal = 0;
+
   let currentTransDate = contextDate;
+  let umumCounter = 0;
+  let penyesuaianCounter = 0;
 
   lines.forEach((line, idx) => {
     const lower = line.toLowerCase();
@@ -214,16 +244,116 @@ export function parseStoryProblemRuleBased(
       currentTransDate = detectedDate;
     }
     const date = currentTransDate;
-    const refNumber = `JU-${String(idx + 1).padStart(3, '0')}`;
 
     if (primaryAmount <= 0) return;
 
     let entries: JournalEntryItem[] = [];
     let desc = line.slice(0, 80);
     let note = '';
+    let category: 'umum' | 'penyesuaian' = 'umum';
+    let needsReviewOverride = false;
+
+    // === JURNAL PENYESUAIAN (AJP) — dicek lebih dulu karena polanya lebih spesifik ===
+
+    // A1. Penyusutan / Depresiasi Aset Tetap
+    if (lower.includes('penyusutan') || lower.includes('disusutkan') || lower.includes('depresiasi')) {
+      category = 'penyesuaian';
+      entries = [
+        { accountCode: bebanPenyusutanAcc.code, accountName: bebanPenyusutanAcc.name, debit: primaryAmount, credit: 0 },
+        { accountCode: akumulasiPenyusutanAcc.code, accountName: akumulasiPenyusutanAcc.name, debit: 0, credit: primaryAmount },
+      ];
+      desc = 'Penyesuaian penyusutan aset tetap periode berjalan';
+      note = 'Beban Penyusutan bertambah (Debit) dan Akumulasi Penyusutan bertambah (Kredit)';
+    }
+
+    // A2. Perlengkapan yang tersisa/terpakai pada akhir periode
+    else if (lower.includes('perlengkapan') && (lower.includes('tersisa') || lower.includes('sisa perlengkapan') || lower.includes('sisa persediaan perlengkapan') || lower.includes('terpakai') || lower.includes('habis dipakai') || lower.includes('habis terpakai'))) {
+      category = 'penyesuaian';
+      const isSisaAmount = lower.includes('tersisa') || lower.includes('sisa');
+      let bebanAmount = primaryAmount;
+      if (isSisaAmount && perlengkapanPurchasedTotal > 0) {
+        // Jika kalimat menyebutkan SISA di akhir periode, beban = total dibeli - sisa
+        bebanAmount = Math.max(perlengkapanPurchasedTotal - primaryAmount, 0);
+      } else if (isSisaAmount && perlengkapanPurchasedTotal === 0) {
+        // Total pembelian perlengkapan tidak terdeteksi dari teks -> tandai untuk ditinjau ulang
+        needsReviewOverride = true;
+      }
+      entries = [
+        { accountCode: bebanPerlengkapanAcc.code, accountName: bebanPerlengkapanAcc.name, debit: bebanAmount, credit: 0 },
+        { accountCode: perlengkapanAcc.code, accountName: perlengkapanAcc.name, debit: 0, credit: bebanAmount },
+      ];
+      desc = 'Penyesuaian pemakaian perlengkapan selama periode berjalan';
+      note = isSisaAmount
+        ? `Perlengkapan terpakai dihitung dari total pembelian (Rp${perlengkapanPurchasedTotal.toLocaleString('id-ID')}) dikurangi sisa akhir (Rp${primaryAmount.toLocaleString('id-ID')})`
+        : 'Beban Perlengkapan bertambah (Debit) dan Perlengkapan berkurang (Kredit) sejumlah yang terpakai';
+    }
+
+    // A3. Sewa/Asuransi/Beban Dibayar Dimuka yang telah menjadi beban
+    else if ((lower.includes('dibayar dimuka') || lower.includes('dibayar di muka')) && (lower.includes('telah') || lower.includes('sudah') || lower.includes('jatuh tempo') || lower.includes('menjadi beban') || lower.includes('kadaluarsa') || lower.includes('habis masa') || lower.includes('berakhir'))) {
+      category = 'penyesuaian';
+      const isAsuransi = lower.includes('asuransi');
+      const isSewa = lower.includes('sewa');
+      const prepaidAcc = isAsuransi ? asuransiPrepaidAcc : isSewa ? sewaPrepaidAcc : bebanDibayarDimukaAcc;
+      const expenseAcc = isAsuransi ? bebanAsuransiAcc : isSewa ? sewaAcc : utilitasAcc;
+      entries = [
+        { accountCode: expenseAcc.code, accountName: expenseAcc.name, debit: primaryAmount, credit: 0 },
+        { accountCode: prepaidAcc.code, accountName: prepaidAcc.name, debit: 0, credit: primaryAmount },
+      ];
+      desc = `Penyesuaian ${isAsuransi ? 'asuransi' : isSewa ? 'sewa' : 'beban'} dibayar dimuka yang telah menjadi beban`;
+      note = `${expenseAcc.name} bertambah (Debit) dan ${prepaidAcc.name} berkurang (Kredit)`;
+    }
+
+    // A4. Pendapatan Diterima Dimuka yang telah menjadi pendapatan
+    else if ((lower.includes('diterima dimuka') || lower.includes('diterima di muka')) && (lower.includes('telah') || lower.includes('sudah') || lower.includes('menjadi pendapatan') || lower.includes('terealisasi') || lower.includes('diselesaikan') || lower.includes('terpenuhi'))) {
+      category = 'penyesuaian';
+      entries = [
+        { accountCode: pendapatanDiterimaDimukaAcc.code, accountName: pendapatanDiterimaDimukaAcc.name, debit: primaryAmount, credit: 0 },
+        { accountCode: pendapatanAcc.code, accountName: pendapatanAcc.name, debit: 0, credit: primaryAmount },
+      ];
+      desc = 'Penyesuaian pendapatan diterima dimuka yang telah menjadi pendapatan';
+      note = 'Pendapatan Diterima Dimuka berkurang (Debit) dan Pendapatan bertambah (Kredit)';
+    }
+
+    // A5. Beban yang Masih Harus Dibayar (Accrued Expense) — gaji/bunga/utilitas belum dibayar akhir periode
+    else if ((lower.includes('masih harus dibayar') || lower.includes('belum dibayar') || lower.includes('terutang')) && (lower.includes('gaji') || lower.includes('bunga') || lower.includes('listrik') || lower.includes('utilitas') || lower.includes('beban'))) {
+      category = 'penyesuaian';
+      const isGaji = lower.includes('gaji');
+      const expenseAcc = isGaji ? gajiAcc : utilitasAcc;
+      const liabilityAcc = isGaji ? utangGajiAcc : bebanAkrualAcc;
+      entries = [
+        { accountCode: expenseAcc.code, accountName: expenseAcc.name, debit: primaryAmount, credit: 0 },
+        { accountCode: liabilityAcc.code, accountName: liabilityAcc.name, debit: 0, credit: primaryAmount },
+      ];
+      desc = `Penyesuaian ${isGaji ? 'gaji karyawan' : 'beban'} yang masih harus dibayar pada akhir periode`;
+      note = `${expenseAcc.name} bertambah (Debit) dan ${liabilityAcc.name} bertambah (Kredit)`;
+    }
+
+    // A6. Pendapatan yang Masih Harus Diterima (Accrued Revenue)
+    else if ((lower.includes('masih harus diterima') || lower.includes('belum diterima') || lower.includes('belum ditagih')) && (lower.includes('pendapatan') || lower.includes('bunga') || lower.includes('jasa'))) {
+      category = 'penyesuaian';
+      entries = [
+        { accountCode: piutangPendapatanAcc.code, accountName: piutangPendapatanAcc.name, debit: primaryAmount, credit: 0 },
+        { accountCode: pendapatanAcc.code, accountName: pendapatanAcc.name, debit: 0, credit: primaryAmount },
+      ];
+      desc = 'Penyesuaian pendapatan yang masih harus diterima pada akhir periode';
+      note = `${piutangPendapatanAcc.name} bertambah (Debit) dan Pendapatan bertambah (Kredit)`;
+    }
+
+    // A7. Piutang Tak Tertagih / Cadangan Kerugian Piutang
+    else if (lower.includes('piutang') && (lower.includes('tak tertagih') || lower.includes('tidak tertagih') || lower.includes('cadangan kerugian') || lower.includes('penyisihan'))) {
+      category = 'penyesuaian';
+      entries = [
+        { accountCode: bebanKerugianPiutangAcc.code, accountName: bebanKerugianPiutangAcc.name, debit: primaryAmount, credit: 0 },
+        { accountCode: cadanganKerugianPiutangAcc.code, accountName: cadanganKerugianPiutangAcc.name, debit: 0, credit: primaryAmount },
+      ];
+      desc = 'Penyesuaian estimasi piutang tak tertagih (cadangan kerugian piutang)';
+      note = `${bebanKerugianPiutangAcc.name} bertambah (Debit) dan ${cadanganKerugianPiutangAcc.name} bertambah (Kredit)`;
+    }
+
+    // === JURNAL UMUM (transaksi normal selama periode berjalan) ===
 
     // 1. Setoran Modal Awal (Modal Tunai)
-    if (lower.includes('modal') && (lower.includes('setor') || lower.includes('investasi') || lower.includes('memulai'))) {
+    else if (lower.includes('modal') && (lower.includes('setor') || lower.includes('investasi') || lower.includes('memulai'))) {
       entries = [
         { accountCode: kasAcc.code, accountName: kasAcc.name, debit: primaryAmount, credit: 0 },
         { accountCode: modalAcc.code, accountName: modalAcc.name, debit: 0, credit: primaryAmount },
@@ -279,6 +409,7 @@ export function parseStoryProblemRuleBased(
     // 4. Pembelian Perlengkapan (Kredit / Tunai)
     else if (lower.includes('perlengkapan') && (lower.includes('beli') || lower.includes('membeli'))) {
       const isKredit = lower.includes('kredit') || lower.includes('tempo') || lower.includes('belum bayar') || lower.includes('dari toko') || lower.includes('faktur');
+      perlengkapanPurchasedTotal += primaryAmount;
       entries = [
         { accountCode: perlengkapanAcc.code, accountName: perlengkapanAcc.name, debit: primaryAmount, credit: 0 },
         { accountCode: isKredit ? utangAcc.code : kasAcc.code, accountName: isKredit ? utangAcc.name : kasAcc.name, debit: 0, credit: primaryAmount },
@@ -296,6 +427,17 @@ export function parseStoryProblemRuleBased(
       ];
       desc = `Pembelian peralatan ${isKredit ? 'secara kredit' : 'secara tunai'}`;
       note = `Peralatan bertambah (Debit), ${isKredit ? 'Utang Usaha bertambah (Kredit)' : 'Kas berkurang (Kredit)'}`;
+    }
+
+    // 5b. Pembelian Barang Dagang / Persediaan (Kredit / Tunai / Murabahah)
+    else if ((lower.includes('barang dagang') || lower.includes('persediaan')) && (lower.includes('beli') || lower.includes('membeli'))) {
+      const isKredit = lower.includes('kredit') || lower.includes('tempo') || lower.includes('murabahah') || lower.includes('belum bayar') || lower.includes('faktur');
+      entries = [
+        { accountCode: persediaanAcc.code, accountName: persediaanAcc.name, debit: primaryAmount, credit: 0 },
+        { accountCode: isKredit ? utangAcc.code : kasAcc.code, accountName: isKredit ? utangAcc.name : kasAcc.name, debit: 0, credit: primaryAmount },
+      ];
+      desc = `Pembelian ${persediaanAcc.name.toLowerCase()} ${isKredit ? 'secara kredit' : 'secara tunai'}`;
+      note = `${persediaanAcc.name} bertambah (Debit), ${isKredit ? 'Utang Usaha bertambah (Kredit)' : 'Kas berkurang (Kredit)'}`;
     }
 
     // 6. Pembayaran Gaji Karyawan
@@ -381,18 +523,23 @@ export function parseStoryProblemRuleBased(
       const totK = entries.reduce((s, e) => s + (e.credit || 0), 0);
       const diff = Math.abs(totD - totK);
 
+      const refNumber =
+        category === 'penyesuaian'
+          ? `AJP-${String((penyesuaianCounter += 1)).padStart(3, '0')}`
+          : `JU-${String((umumCounter += 1)).padStart(3, '0')}`;
+
       results.push({
         date,
         refNumber,
         description: desc,
-        category: 'umum',
+        category,
         entries,
         notes: note,
         isBalanced: diff === 0,
         totalDebit: totD,
         totalCredit: totK,
         difference: diff,
-        needsReview: diff !== 0,
+        needsReview: diff !== 0 || needsReviewOverride,
       });
     }
   });

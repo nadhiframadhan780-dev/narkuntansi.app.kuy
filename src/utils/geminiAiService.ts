@@ -21,6 +21,108 @@ export interface GeminiParseResponse {
 }
 
 /**
+ * Reconciles AI-returned journal entries against the REAL Chart of Accounts (accounts)
+ * currently active in the app. AI models can occasionally hallucinate an account code
+ * or name that doesn't exactly exist in the user's COA (e.g. slightly different wording).
+ * This function corrects that in-place wherever possible, and only falls back to trusting
+ * the AI's raw output (flagged via needsReview) when no reasonable match can be found —
+ * this is what keeps auto-filled entries accurate instead of silently posting to a
+ * non-existent or wrong account.
+ */
+function reconcileEntriesWithCoa(
+  entries: JournalEntryItem[],
+  accounts: Account[]
+): { entries: JournalEntryItem[]; hadMismatch: boolean } {
+  let hadMismatch = false;
+
+  const reconciled = entries.map((entry) => {
+    // 1. Exact code match — best case, nothing to do.
+    const byCode = accounts.find((a) => a.code === entry.accountCode);
+    if (byCode) {
+      return { ...entry, accountName: byCode.name };
+    }
+
+    // 2. Exact (case-insensitive) name match — fix the code to the real one.
+    const byExactName = accounts.find(
+      (a) => a.name.toLowerCase() === (entry.accountName || '').toLowerCase()
+    );
+    if (byExactName) {
+      hadMismatch = true;
+      return { ...entry, accountCode: byExactName.code, accountName: byExactName.name };
+    }
+
+    // 3. Partial/fuzzy name match (either contains the other).
+    const nameLower = (entry.accountName || '').toLowerCase();
+    const byPartialName = accounts.find(
+      (a) =>
+        nameLower.length > 2 &&
+        (a.name.toLowerCase().includes(nameLower) || nameLower.includes(a.name.toLowerCase()))
+    );
+    if (byPartialName) {
+      hadMismatch = true;
+      return { ...entry, accountCode: byPartialName.code, accountName: byPartialName.name };
+    }
+
+    // 4. No match found at all — keep as-is but signal for review instead of silently
+    // trusting a possibly-invented account.
+    hadMismatch = true;
+    return entry;
+  });
+
+  return { entries: reconciled, hadMismatch };
+}
+
+/**
+ * Converts raw AI transaction objects (from either the backend endpoint or the direct
+ * client-side Gemini call) into validated, COA-reconciled ParsedTransactionDraft objects.
+ */
+function buildDraftsFromAiTransactions(
+  rawTransactions: any[],
+  accounts: Account[],
+  standard: AccountingStandard
+): ParsedTransactionDraft[] {
+  let umumIdx = 0;
+  let penyesuaianIdx = 0;
+
+  return rawTransactions.map((tx: any) => {
+    const rawEntries: JournalEntryItem[] = (tx.entries || []).map((e: any) => ({
+      accountCode: String(e.accountCode ?? '').trim(),
+      accountName: String(e.accountName ?? '').trim(),
+      debit: Math.round(Number(e.debit) || 0),
+      credit: Math.round(Number(e.credit) || 0),
+    }));
+
+    const { entries, hadMismatch } = reconcileEntriesWithCoa(rawEntries, accounts);
+
+    const totalDebit = entries.reduce((acc, e) => acc + (Number(e.debit) || 0), 0);
+    const totalCredit = entries.reduce((acc, e) => acc + (Number(e.credit) || 0), 0);
+    const diff = Math.abs(totalDebit - totalCredit);
+
+    const category: 'umum' | 'penyesuaian' = tx.category === 'penyesuaian' ? 'penyesuaian' : 'umum';
+    const refNumber =
+      tx.refNumber && /^(JU|AJP)-\d+/i.test(tx.refNumber)
+        ? tx.refNumber
+        : category === 'penyesuaian'
+        ? `AJP-${String((penyesuaianIdx += 1)).padStart(3, '0')}`
+        : `JU-${String((umumIdx += 1)).padStart(3, '0')}`;
+
+    return {
+      date: tx.date || new Date().toISOString().slice(0, 10),
+      refNumber,
+      description: tx.description || 'Transaksi Akuntansi',
+      category,
+      entries,
+      notes: tx.notes || `Dianalisis oleh Google Gemini AI (${standard})`,
+      totalDebit,
+      totalCredit,
+      isBalanced: diff === 0,
+      difference: diff,
+      needsReview: diff !== 0 || hadMismatch,
+    };
+  });
+}
+
+/**
  * Standard descriptions for AI System Prompt
  */
 const STANDARD_PROMPTS: Record<AccountingStandard, string> = {
@@ -199,27 +301,11 @@ export async function parseTransactionsWithGeminiAI(params: {
     if (res.ok) {
       const data = await res.json();
       if (data.transactions && Array.isArray(data.transactions)) {
-        const drafts: ParsedTransactionDraft[] = data.transactions.map((tx: any, idx: number) => {
-          const totalDebit = (tx.entries || []).reduce((acc: number, e: JournalEntryItem) => acc + (Number(e.debit) || 0), 0);
-          const totalCredit = (tx.entries || []).reduce((acc: number, e: JournalEntryItem) => acc + (Number(e.credit) || 0), 0);
-          const diff = Math.abs(totalDebit - totalCredit);
-          return {
-            date: tx.date || new Date().toISOString().slice(0, 10),
-            refNumber: tx.refNumber || `JU-${String(idx + 1).padStart(3, '0')}`,
-            description: tx.description || 'Transaksi Akuntansi',
-            category: tx.category || 'umum',
-            entries: tx.entries || [],
-            notes: tx.notes || `Dianalisis oleh Google Gemini AI (${standard})`,
-            totalDebit,
-            totalCredit,
-            isBalanced: diff === 0,
-            difference: diff,
-          };
-        });
+        const drafts = buildDraftsFromAiTransactions(data.transactions, coaList, standard);
 
         return {
           drafts,
-          message: `Berhasil dianalisis oleh Google Gemini AI (${drafts.length} transaksi berpasangan seimbang).`,
+          message: `Berhasil dianalisis oleh Google Gemini AI (${drafts.length} transaksi: ${drafts.filter((d) => d.category === 'umum').length} Jurnal Umum, ${drafts.filter((d) => d.category === 'penyesuaian').length} Jurnal Penyesuaian).`,
           isAI: true,
         };
       }
@@ -228,15 +314,22 @@ export async function parseTransactionsWithGeminiAI(params: {
     // If backend unavailable, try direct client-side
   }
 
-  // 2. Direct Gemini Call for GitHub Pages
+  // 2. Direct Gemini Call for GitHub Pages / static hosting without backend
   if (apiKey?.trim()) {
     try {
       const cleanKey = apiKey.trim();
       const directUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${encodeURIComponent(cleanKey)}`;
 
       const systemPrompt = `Anda adalah Akuntan Publik Indonesia (CPA).
-Analisis teks transaksi/soal cerita akuntansi bahasa Indonesia, dan buatkan jurnal umum double-entry yang BALANCE (Total Debit = Total Kredit) sesuai standar ${standard}.
-Daftar Akun: ${JSON.stringify(coaList.map((a) => ({ code: a.code, name: a.name })), null, 1)}
+Analisis teks transaksi/soal cerita akuntansi bahasa Indonesia. Soal ini bisa berisi DUA jenis entri sekaligus: (1) transaksi biasa selama periode berjalan, dan (2) data penyesuaian akhir periode (biasanya bagian terpisah bertanda "Data Penyesuaian" atau berlabel huruf/angka setelah daftar transaksi utama). Buatkan jurnal double-entry yang BALANCE (Total Debit = Total Kredit) sesuai standar ${standard}, dan klasifikasikan setiap entri dengan benar.
+
+Daftar Akun (WAJIB dipakai apa adanya, jangan mengarang kode baru): ${JSON.stringify(coaList.map((a) => ({ code: a.code, name: a.name })), null, 1)}
+
+ATURAN KATEGORI:
+- "category": "umum" untuk transaksi biasa. Nomor referensi "JU-001", "JU-002", dst.
+- "category": "penyesuaian" untuk jurnal penyesuaian akhir periode (penyusutan aset tetap, perlengkapan terpakai/tersisa, beban/pendapatan dibayar & diterima dimuka yang sudah menjadi beban/pendapatan, beban/pendapatan akrual, penyisihan piutang tak tertagih). Nomor referensi "AJP-001", "AJP-002", dst.
+- Untuk penyesuaian jenis akrual, sertakan frasa "yang masih harus dibayar" (beban akrual) atau "yang masih harus diterima" (pendapatan akrual) di dalam "description" apa adanya, agar sistem bisa membuat jurnal pembalik otomatis.
+- Jika tidak ada data penyesuaian pada soal, jangan memaksakan membuatnya.
 
 KEMBALIKAN HANYA FORMAT JSON VALID:
 {
@@ -274,27 +367,11 @@ KEMBALIKAN HANYA FORMAT JSON VALID:
         const parsed = JSON.parse(jsonText);
 
         if (parsed.transactions && Array.isArray(parsed.transactions)) {
-          const drafts: ParsedTransactionDraft[] = parsed.transactions.map((tx: any, idx: number) => {
-            const totalDebit = (tx.entries || []).reduce((acc: number, e: JournalEntryItem) => acc + (Number(e.debit) || 0), 0);
-            const totalCredit = (tx.entries || []).reduce((acc: number, e: JournalEntryItem) => acc + (Number(e.credit) || 0), 0);
-            const diff = Math.abs(totalDebit - totalCredit);
-            return {
-              date: tx.date || new Date().toISOString().slice(0, 10),
-              refNumber: tx.refNumber || `JU-${String(idx + 1).padStart(3, '0')}`,
-              description: tx.description || 'Transaksi Akuntansi',
-              category: tx.category || 'umum',
-              entries: tx.entries || [],
-              notes: tx.notes || `Dianalisis oleh Google Gemini AI (${standard})`,
-              totalDebit,
-              totalCredit,
-              isBalanced: diff === 0,
-              difference: diff,
-            };
-          });
+          const drafts = buildDraftsFromAiTransactions(parsed.transactions, coaList, standard);
 
           return {
             drafts,
-            message: `Berhasil dianalisis oleh Google Gemini AI (${drafts.length} transaksi seimbang).`,
+            message: `Berhasil dianalisis oleh Google Gemini AI (${drafts.length} transaksi: ${drafts.filter((d) => d.category === 'umum').length} Jurnal Umum, ${drafts.filter((d) => d.category === 'penyesuaian').length} Jurnal Penyesuaian).`,
             isAI: true,
           };
         }
